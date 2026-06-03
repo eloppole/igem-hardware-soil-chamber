@@ -1,0 +1,19 @@
+const int relay_pin_1 = 9;
+const int relay_pin_2 = 8;
+ 
+void setup() {
+  pinMode(relay_pin_1, OUTPUT);
+  digitalWrite(relay_pin_1, LOW);
+  pinMode(relay_pin_2, OUTPUT);
+  digitalWrite(relay_pin_2, LOW);
+}
+ 
+void loop() {
+  digitalWrite(relay_pin_1, HIGH);
+  digitalWrite(relay_pin_2, LOW);
+  delay(2000);
+  digitalWrite(relay_pin_2, HIGH);
+  delay(2000);
+  digitalWrite(relay_pin_2, LOW);
+  delay(2000);
+}
