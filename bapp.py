@@ -9,16 +9,17 @@ app = Flask(__name__)
 led  = LED(17)
 pump = OutputDevice(4)
 
-# ── UV SENSOR (MCP3008) ───────────────────────────────────────────
-# Wired to GPIO 27/22/5/18 -- NOT the hardware SPI pins -- so gpiozero
-# uses software (bit-bang) SPI. Naming the pins is what selects that mode.
-#   CLK  -> GPIO27   (clock_pin)
-#   DOUT -> GPIO22   (miso_pin, data out of the MCP)
-#   DIN  -> GPIO5    (mosi_pin, data into the MCP)
-#   CS   -> GPIO18   (select_pin)
-# Add more sensors on other channels later, e.g. channel=1, channel=2 ...
+# ── UV SENSOR (MCP3008, hardware SPI) ─────────────────────────────
+# Now on the Pi's hardware SPI0 bus, so NO pin arguments are needed --
+# gpiozero uses the dedicated SPI peripheral automatically.
+#   MCP CLK  (pin 13) -> SCLK  (GPIO11 / header pin 23)
+#   MCP DOUT (pin 12) -> MISO  (GPIO9  / header pin 21)
+#   MCP DIN  (pin 11) -> MOSI  (GPIO10 / header pin 19)
+#   MCP CS   (pin 10) -> CE0   (GPIO8  / header pin 24)
+# Requires SPI enabled:  sudo raspi-config -> Interface Options -> SPI -> reboot
+# More sensors later = just more channels on the same bus: channel=1, 2, 3 ...
 VREF = 3.3
-uv = MCP3008(channel=0, clock_pin=27, miso_pin=22, mosi_pin=5, select_pin=18)
+uv = MCP3008(channel=0)          # CE0 by default; use device=1 only if on CE1
 
 def read_uv():
     """Return (raw 0-1, volts, approx UV index)."""
