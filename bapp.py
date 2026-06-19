@@ -183,12 +183,12 @@ input[type=number]::placeholder { color: #475569; }
       <div>
         <img src="/feed/0" class="cam-feed" id="cam0-img" onerror="this.style.display='none';document.getElementById('cam0-off').style.display='flex'">
         <div class="cam-off" id="cam0-off" style="display:none">camera off</div>
-        <div class="cam-label">Side View, Camera 0 — primary &nbsp;<span class="timer" id="cam0-timer"></span></div>
+        <div class="cam-label">Side View, Camera 0 &nbsp;<span class="timer" id="cam0-timer"></span></div>
       </div>
       <div>
         <img src="/feed/1" class="cam-feed" id="cam1-img" onerror="this.style.display='none';document.getElementById('cam1-off').style.display='flex'">
         <div class="cam-off" id="cam1-off" style="display:none">camera off</div>
-        <div class="cam-label">Top view, Camera 1 — secondary &nbsp;<span class="timer" id="cam1-timer"></span></div>
+        <div class="cam-label">Top view, Camera 1 &nbsp;<span class="timer" id="cam1-timer"></span></div>
       </div>
     </div>
     <hr class="divider">
