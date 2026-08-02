@@ -39,8 +39,18 @@ Commands once running:
     run <sec>                 - full experiment cycle:
                                   before-photo, UV on, log sensor, UV off, after-photo
     status                    - show current state
+    kill [reason]             - software E-stop: cut the 12V rails and exit
+    interlock                 - show kill switch / E-stop loop state
     help                      - this message
     quit                      - turn UV off and exit
+
+Kill switch:
+    A latching E-stop cuts the 12V rails in hardware, with no involvement from
+    the Pi. This script additionally watches the E-stop loop and runs a
+    watchdog; see killswitch/DESIGN.md. After any kill event the latch file
+    blocks the next start until it is cleared deliberately:
+        python3 -m killswitch --status
+        python3 -m killswitch --clear-latch
 """
 
 import sys
@@ -60,6 +70,8 @@ try:
     import spidev
 except ImportError:
     sys.exit("Missing spidev. Install with: sudo apt install python3-spidev")
+
+from killswitch import InterlockOpen, KillSwitch, KillSwitchLatched, TriggerSource
 
 try:
     from picamera2 import Picamera2
@@ -170,6 +182,7 @@ class SensorLogger(threading.Thread):
 
     def run(self):
         f = open(self.csv_path, "a") if self.csv_path else None
+        hb = kill_switch.heartbeat if kill_switch else lambda source: None
         if f and f.tell() == 0:
             f.write("timestamp,uv_on,adc,volts,mw_cm2,label\n")
         t0 = time.time()
@@ -177,6 +190,7 @@ class SensorLogger(threading.Thread):
         try:
             while not self.stop_flag.is_set():
                 r = read_uv()
+                hb("sensor-logger")     # proves the acquisition loop is alive
                 ts = datetime.now().isoformat(timespec="milliseconds")
                 line = f"{ts},{uv_state()},{r['adc']:.1f},{r['volts']:.4f},{r['mw_cm2']:.4f},{self.label}"
                 self.readings.append(r)
@@ -202,7 +216,11 @@ class SensorLogger(threading.Thread):
 state = {
     "logger": None,
     "expose_thread": None,
+    "exposing": False,
 }
+
+# Set by init_kill_switch() before the shell starts.
+kill_switch = None
 
 def cmd_on(_args):
     uv_on()
@@ -249,11 +267,14 @@ def cmd_expose(args):
     state["logger"] = lg
 
     print(f"Exposing for {sec} seconds. Logging to {path}")
+    state["exposing"] = True
     uv_on()
     try:
         end = time.time() + sec
         while time.time() < end:
             remaining = end - time.time()
+            if kill_switch:
+                kill_switch.heartbeat("expose")
             print(f"  {int(sec - remaining)}/{int(sec)} s   ", end="\r")
             time.sleep(min(1.0, remaining))
         print()
@@ -263,6 +284,7 @@ def cmd_expose(args):
         uv_off()
         lg.stop()
         state["logger"] = None
+        state["exposing"] = False
         print("Exposure complete. UV OFF.")
 
 def cmd_snap(args):
@@ -294,23 +316,106 @@ def cmd_status(_args):
     print(f"  Logger:        {'running' if state['logger'] else 'stopped'}")
     print(f"  Cameras:       {len(cameras)} available")
     print(f"  Data dir:      {DATA_DIR}")
+    if kill_switch:
+        ks = kill_switch.status()
+        print(f"  Interlock:     {'CLOSED (healthy)' if ks['sense_healthy'] else 'OPEN — KILL'}"
+              f"  armed={ks['armed']}")
     r = read_uv()
     print(f"  Live sensor:   {r['mw_cm2']:.3f} mW/cm^2")
+
+def cmd_kill(args):
+    """Software E-stop. Same shutdown path as the physical button: rails down,
+    everything off, event logged, latched, process exits."""
+    if not kill_switch:
+        print("Kill switch not armed; use the physical E-stop.")
+        return
+    reason = " ".join(args) if args else "operator issued 'kill' at the chamber prompt"
+    kill_switch.trip(TriggerSource.MANUAL, reason)
+
+def cmd_interlock(_args):
+    if not kill_switch:
+        print("Kill switch not armed.")
+        return
+    for key, value in kill_switch.status().items():
+        print(f"  {key:<24} {value}")
 
 def cmd_help(_args):
     print(__doc__.split("Commands once running:")[1].split("\n\n")[0])
 
+# ---------- Kill switch ----------
+# Layer 1 (the latching E-stop wired into the 12V contactor coil) works with no
+# help from this script. What follows registers the software half: the shutdown
+# actions the listener and watchdog run, and the state recorded with the event.
+
+def _stop_logging():
+    """Idempotent: stop the sensor logger and close its CSV."""
+    lg = state.get("logger")
+    if lg:
+        lg.stop()
+        lg.join(timeout=2.0)
+        state["logger"] = None
+
+def _close_cameras():
+    """Idempotent: release both camera handles."""
+    for cam in cameras:
+        try:
+            cam.stop()
+        except Exception:
+            pass
+        try:
+            cam.close()
+        except Exception:
+            pass
+
+def _chamber_state():
+    """Snapshot written into the kill event log."""
+    try:
+        uv = uv_state()
+    except Exception as e:
+        uv = f"unreadable: {e!r}"
+    try:
+        sensor = read_uv()["mw_cm2"]
+    except Exception as e:
+        sensor = f"unreadable: {e!r}"
+    return {
+        "uv_pin": uv,
+        "uv_mw_cm2": sensor,
+        "logging": state.get("logger") is not None,
+        "exposing": state.get("exposing", False),
+        "cameras": len(cameras),
+        "data_dir": DATA_DIR,
+    }
+
+def init_kill_switch():
+    """Arm before anything can be energized. Refuses to run if a previous kill
+    is still latched or if the E-stop loop is open."""
+    global kill_switch
+    # Share chamber.py's already-open gpiochip handle rather than opening a
+    # second one against the same chip.
+    ks = KillSwitch(gpio_handle=_chip)
+    ks.register_shutdown_hook(uv_off,        "uv-off",        priority=0)
+    ks.register_shutdown_hook(_stop_logging, "stop-logging",  priority=1)
+    ks.register_shutdown_hook(_close_cameras, "close-cameras", priority=2)
+    ks.register_state_provider(_chamber_state)
+    # Only demand a heartbeat while the UV strip is actually energized;
+    # otherwise an operator idling at the prompt would trip the watchdog.
+    ks.register_activity_gate(lambda: uv_state() == 1 or state.get("exposing", False))
+    ks.arm()
+    kill_switch = ks
+    return ks
+
 # ---------- Cleanup ----------
 def _cleanup():
     try:
-        if state.get("logger"):
-            state["logger"].stop()
-        uv_off()
+        if kill_switch and kill_switch.armed:
+            # Runs the same hooks and drops the interlock; no latch on a clean exit.
+            kill_switch.disarm(reason="chamber.py exiting")
+        else:
+            _stop_logging()
+            uv_off()
+            _close_cameras()
         lgpio.gpiochip_close(_chip)
         spi.close()
-        for cam in cameras:
-            try: cam.close()
-            except Exception: pass
     except Exception:
         pass
 
@@ -326,6 +431,8 @@ COMMANDS = {
     "snap":   cmd_snap,
     "run":    cmd_run,
     "status": cmd_status,
+    "kill":      cmd_kill,
+    "interlock": cmd_interlock,
     "help":   cmd_help,
     "?":      cmd_help,
 }
@@ -344,6 +451,8 @@ def shell():
             break
         if not line:
             continue
+        if kill_switch:
+            kill_switch.heartbeat("shell")
         parts = line.split()
         cmd, args = parts[0].lower(), parts[1:]
         if cmd in ("quit", "exit", "q"):
@@ -359,4 +468,13 @@ def shell():
 
 # ---------- Entry ----------
 if __name__ == "__main__":
+    try:
+        init_kill_switch()
+    except KillSwitchLatched as e:
+        sys.exit(f"\nREFUSING TO START — {e}\n")
+    except InterlockOpen as e:
+        sys.exit(f"\nREFUSING TO START — {e}\n")
+    except Exception as e:
+        # No interlock supervision means no UV and no pumps. Never fall through.
+        sys.exit(f"\nREFUSING TO START — kill switch could not arm: {e!r}\n")
     shell()

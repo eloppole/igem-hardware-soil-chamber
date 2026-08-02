@@ -3,9 +3,14 @@ from gpiozero import OutputDevice, PWMOutputDevice, MCP3008
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
-import io, time, threading
+import io, sys, time, threading
+
+from killswitch import InterlockOpen, KillSwitch, KillSwitchLatched, TriggerSource
 
 app = Flask(__name__)
+
+# Set by init_kill_switch() before the server starts serving.
+kill_switch = None
 
 # ── PIN SETUP ─────────────────────────────────────────────────────
 uv_led = OutputDevice(17)
@@ -62,11 +67,22 @@ pump_end_time = {name: 0.0   for name in pumps}
 def run_pump_for(name, seconds, duty):
     try:
         pumps[name].value = duty
-        time.sleep(seconds)
+        if kill_switch:
+            kill_switch.report_pump_state(name, True, commanded_flow=duty)
+        # Chunked instead of one long sleep: this loop is the thing responsible
+        # for switching the pump back off, so it is the thing that must prove
+        # to the watchdog that it is still alive.
+        end = time.time() + seconds
+        while time.time() < end:
+            if kill_switch:
+                kill_switch.heartbeat(f"pump:{name}")
+            time.sleep(max(0.0, min(0.5, end - time.time())))
     finally:
         pumps[name].off()
         pump_running[name]  = False
         pump_end_time[name] = 0.0
+        if kill_switch:
+            kill_switch.report_pump_state(name, False)
 
 # ── UV SENSOR ─────────────────────────────────────────────────────
 VREF = 3.3
@@ -115,6 +131,79 @@ def stop_camera_after(index, seconds):
         cam_end_time[index] = 0.0
     except Exception:
         pass
+
+# ── KILL SWITCH ───────────────────────────────────────────────────
+# The latching E-stop cuts both 12V rails in hardware without the Pi. What
+# follows is the software half: the shutdown actions the listener and watchdog
+# run, and the state recorded with the event. See killswitch/DESIGN.md.
+
+def all_pumps_off():
+    """Idempotent: safe to call when the pumps are already off or unpowered."""
+    for name, pump in pumps.items():
+        try:
+            pump.off()
+        except Exception:
+            pass
+        pump_running[name]  = False
+        pump_end_time[name] = 0.0
+
+def uv_off():
+    """Idempotent."""
+    try:
+        uv_led.off()
+    except Exception:
+        pass
+
+def stop_cameras():
+    """Idempotent: stop recording and release both camera handles."""
+    for i, cam in enumerate(cameras):
+        try:
+            if cam_running[i]:
+                cam.stop_recording()
+        except Exception:
+            pass
+        cam_running[i] = False
+        try:
+            cam.close()
+        except Exception:
+            pass
+
+def chamber_state():
+    """Snapshot written into the kill event log."""
+    snap = {"pumps": {}, "cameras": list(cam_running)}
+    for name, pump in pumps.items():
+        try:
+            snap["pumps"][name] = {"duty": round(pump.value, 3),
+                                   "timed_run": pump_running[name]}
+        except Exception as e:
+            snap["pumps"][name] = f"unreadable: {e!r}"
+    try:
+        snap["uv_led"] = int(uv_led.value)
+    except Exception as e:
+        snap["uv_led"] = f"unreadable: {e!r}"
+    try:
+        raw, volts, uv_index = read_uv()
+        snap["uv_sensor"] = {"raw": raw, "volts": volts, "uv_index": uv_index}
+    except Exception as e:
+        snap["uv_sensor"] = f"unreadable: {e!r}"
+    return snap
+
+def init_kill_switch():
+    """Arm before the server accepts requests. Refuses to start if a previous
+    kill is still latched or the E-stop loop is open."""
+    global kill_switch
+    ks = KillSwitch(GPIO_BACKEND="gpiozero")
+    ks.register_shutdown_hook(all_pumps_off, "pumps-off",     priority=0)
+    ks.register_shutdown_hook(uv_off,        "uv-off",        priority=1)
+    ks.register_shutdown_hook(stop_cameras,  "stop-cameras",  priority=2)
+    ks.register_state_provider(chamber_state)
+    # Demand a heartbeat only while a timed pump run is in flight -- that run
+    # loop is what must eventually stop the pump. An idle server, or a pump
+    # switched on manually with an operator present, is not a stalled loop.
+    ks.register_activity_gate(lambda: any(pump_running.values()))
+    ks.arm()
+    kill_switch = ks
+    return ks
 
 def gen(index):
     out = outputs[index]
@@ -169,12 +258,30 @@ input[type=number]::placeholder { color: #475569; }
 .uv-meta-item span { color: #94a3b8; }
 .pump-row { padding: 12px 0; border-bottom: 0.5px solid #2d3148; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .pump-row:last-child { border-bottom: none; padding-bottom: 0; }
+.estop-card { background: #2a1215; border-color: #7f1d1d; }
+.btn-stop { background: #7f1d1d; border-color: #b91c1c; color: #fecaca; font-weight: 600; padding: 12px 22px; }
+.btn-stop:hover { background: #991b1b; }
+.pill-kill { background: #7f1d1d; color: #fecaca; }
+.estop-note { font-size: 12px; color: #94a3b8; margin-top: 8px; }
 </style>
 </head>
 <body>
 <h1>iGEM Chamber Controller</h1>
 <p class="subtitle">Raspberry Pi 5 — UV Soil Simulation System</p>
 <div class="grid">
+
+  <!-- Kill switch -->
+  <div class="card full estop-card">
+    <div class="card-title">Emergency stop</div>
+    <div class="row">
+      <button class="btn btn-stop" onclick="softKill()">SOFTWARE E-STOP</button>
+      <span class="pill" id="interlock-pill">—</span>
+      <span class="estop-note">
+        The physical latching E-stop is the primary cut and works with the Pi off.
+        This button runs the same shutdown path, then stops the server.
+      </span>
+    </div>
+  </div>
 
   <!-- Cameras -->
   <div class="card full">
@@ -292,9 +399,29 @@ function timedCam(i) {
   if (!secs) return;
   fetch(`/cam/run/${i}?seconds=${secs}`).then(poll);
 }
+function softKill() {
+  if (!confirm('Cut both 12V rails, stop everything and shut down the server?\n\n'
+             + 'Restarting requires clearing the kill latch on the Pi.')) return;
+  // POST so that no link prefetch or page reload can ever fire this.
+  fetch('/kill', {method: 'POST'}).catch(() => {});
+  document.getElementById('interlock-pill').textContent = 'KILLED';
+  document.getElementById('interlock-pill').className   = 'pill pill-kill';
+}
+function setInterlock(d) {
+  const el = document.getElementById('interlock-pill');
+  if (!el) return;
+  if (d.interlock === undefined || d.interlock === null) {
+    el.textContent = 'NOT ARMED'; el.className = 'pill pill-off';
+  } else if (d.interlock) {
+    el.textContent = 'INTERLOCK OK'; el.className = 'pill pill-on';
+  } else {
+    el.textContent = 'LOOP OPEN'; el.className = 'pill pill-kill';
+  }
+}
 async function poll() {
   try {
     const d = await fetch('/status').then(r => r.json());
+    setInterlock(d);
     setPill('led-pill',   d.led,   false);
     ['pump1','pump2','pump3'].forEach(n => {
       setPill(n + '-pill', d[n] > 0, d[n + '_running']);
@@ -333,7 +460,21 @@ def status():
     for i in range(len(cameras)):
         data[f"cam{i}"]             = cam_running[i]
         data[f"cam{i}_remaining"]   = round(max(0.0, cam_end_time[i] - now), 1) if cam_end_time[i] > now else 0.0
+    if kill_switch:
+        ks = kill_switch.status()
+        data["interlock"] = ks["sense_healthy"]
+        data["armed"]     = ks["armed"]
     return jsonify(data)
+
+@app.route("/kill", methods=["POST"])
+def kill():
+    """Software E-stop. POST only, so nothing can trigger it by following a
+    link. Runs the same shutdown path as the physical button, then exits."""
+    if not kill_switch:
+        return ("kill switch not armed", 503)
+    kill_switch.trip(TriggerSource.MANUAL, "software E-stop from the web UI "
+                                           f"({request.remote_addr})")
+    return ("", 204)
 
 @app.route("/toggle/led")
 def toggle_led():
@@ -407,4 +548,12 @@ def snap(target):
     return ("", 204)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    try:
+        init_kill_switch()
+    except (KillSwitchLatched, InterlockOpen) as e:
+        sys.exit(f"\nREFUSING TO START — {e}\n")
+    except Exception as e:
+        # No interlock supervision means no pumps and no UV. Never fall through.
+        sys.exit(f"\nREFUSING TO START — kill switch could not arm: {e!r}\n")
+    # use_reloader would fork a second process holding a second kill switch.
+    app.run(host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
