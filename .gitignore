@@ -1,0 +1,7 @@
+# SSH keys and credentials — never commit
+.ssh/
+**/.ssh/
+*.pem
+*_id_ed25519
+*_id_rsa
+*.key
