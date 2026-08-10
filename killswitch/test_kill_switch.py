@@ -3,8 +3,15 @@ Offline tests — no Raspberry Pi required. Run from the repo root:
 
     python3 -m killswitch.test_kill_switch
 
-Every test drives the SimBackend, so the trip paths are exercised for real
-(threads, hooks, logging, latch) without any hardware.
+KillSwitchTestCase drives the SimBackend with a fully wired interlock
+(INTERLOCK_SENSE_ENABLED / INTERLOCK_ARM_ENABLED forced on), so the sense-line
+and arm-line paths stay covered for the day that wiring exists.
+
+AsBuiltRigTestCase covers the rig as it is actually built: a mechanical lid
+switch with no sense wire and no Pi-side interlock, where the kill switch claims
+no GPIO at all and the shutdown hooks are the whole power-down.
+
+Either way the trip paths run for real — threads, hooks, logging, latch.
 """
 
 import logging
@@ -15,7 +22,13 @@ import time
 import unittest
 
 from .backends import SimBackend
-from .core import InterlockOpen, KillSwitch, KillSwitchLatched, TriggerSource
+from .core import (
+    InterlockOpen,
+    KillSwitch,
+    KillSwitchLatched,
+    TriggerSource,
+    clear_latch,
+)
 
 HEALTHY = 0
 KILL = 1
@@ -32,6 +45,10 @@ class KillSwitchTestCase(unittest.TestCase):
 
     def make(self, **overrides):
         defaults = dict(
+            # This case is about the wired-interlock path, which is off by
+            # default because the rig as built has neither wire.
+            INTERLOCK_SENSE_ENABLED=True,
+            INTERLOCK_ARM_ENABLED=True,
             DATA_DIR=self.tmp,
             LOG_PATH=os.path.join(self.tmp, "killswitch.log"),
             EVENT_LOG_PATH=os.path.join(self.tmp, "events.jsonl"),
@@ -94,9 +111,9 @@ class KillSwitchTestCase(unittest.TestCase):
         with self.assertRaises(KillSwitchLatched):
             again.arm()
 
-    # -- layer 2: the E-stop listener ---------------------------------------
+    # -- layer 2: the interlock listener -------------------------------------
 
-    def test_estop_line_trips_and_runs_hooks_in_priority_order(self):
+    def test_interlock_line_trips_and_runs_hooks_in_priority_order(self):
         ks = self.make()
         ks.register_shutdown_hook(self.hook("cameras"), "cameras", priority=2)
         ks.register_shutdown_hook(self.hook("pumps"), "pumps", priority=0)
@@ -110,7 +127,7 @@ class KillSwitchTestCase(unittest.TestCase):
         self.assertEqual(self.calls, ["pumps", "uv", "cameras"])
         self.assertEqual(self.backend.levels[ks.cfg.KILL_ARM_PIN], 0)
         event = ks.event
-        self.assertEqual(event.source, TriggerSource.ESTOP_LOOP)
+        self.assertEqual(event.source, TriggerSource.INTERLOCK_LOOP)
         self.assertEqual(event.state["host"], {"uv_pin": 1, "logger": "running"})
         self.assertTrue(all(h["ok"] for h in event.hooks))
 
@@ -309,6 +326,96 @@ class KillSwitchTestCase(unittest.TestCase):
         self.assertTrue(status["sense_healthy"])
         self.assertFalse(status["latched"])
         ks.disarm()
+
+
+class AsBuiltRigTestCase(unittest.TestCase):
+    """The rig as drawn in docs/circuit_image.svg: a lid switch in the 12 V
+    feed, no sense wire, no Pi-side interlock. The kill switch must arm anyway
+    — refusing to start would leave the chamber with no watchdog and no latch
+    at all — but it must be honest about what it can and cannot do."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="killswitch-asbuilt-")
+        self.calls = []
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, **overrides):
+        defaults = dict(
+            DATA_DIR=self.tmp,
+            LOG_PATH=os.path.join(self.tmp, "killswitch.log"),
+            EVENT_LOG_PATH=os.path.join(self.tmp, "events.jsonl"),
+            LATCH_PATH=os.path.join(self.tmp, "KILL_LATCH"),
+            EXIT_ON_TRIP=False,
+            INSTALL_SIGNAL_HANDLERS=False,
+            LOG_TO_STDERR=False,
+            WATCHDOG_POLL_INTERVAL_S=0.02,
+            HEARTBEAT_GRACE_S=0.0,
+        )
+        defaults.update(overrides)
+        # Deliberately no backend= : there is no GPIO to give it.
+        ks = KillSwitch(**defaults)
+        for handler in list(ks.log.handlers):
+            ks.log.removeHandler(handler)
+            handler.close()
+        ks.log.addHandler(logging.NullHandler())
+        return ks
+
+    def hook(self, name):
+        def fn():
+            self.calls.append(name)
+        return fn
+
+    def test_arms_without_any_gpio(self):
+        """No sense wire is not the same as an open loop: arming must succeed,
+        and it must not open a GPIO backend it has no pins for."""
+        ks = self.make()
+        ks.arm()
+        self.assertTrue(ks.armed)
+        self.assertIsNone(ks._backend)
+        ks.disarm()
+
+    def test_status_distinguishes_unwired_from_unhealthy(self):
+        ks = self.make()
+        ks.arm()
+        status = ks.status()
+        self.assertFalse(status["interlock_sense_enabled"])
+        self.assertFalse(status["interlock_arm_enabled"])
+        # None means "no sense wire exists", not "the loop is open".
+        self.assertIsNone(status["sense_healthy"])
+        self.assertIsNone(status["backend"])
+        ks.disarm()
+
+    def test_watchdog_still_trips_and_hooks_are_the_shutdown(self):
+        ks = self.make(HEARTBEAT_TIMEOUT_S=0.15)
+        ks.register_shutdown_hook(self.hook("cameras"), "cameras", priority=2)
+        ks.register_shutdown_hook(self.hook("pumps"), "pumps", priority=0)
+        ks.register_shutdown_hook(self.hook("uv"), "uv", priority=1)
+        ks.arm()
+
+        self.assertTrue(ks.wait_for_trip(timeout=2))
+        self.assertEqual(ks.event.source, TriggerSource.WATCHDOG_HEARTBEAT)
+        self.assertEqual(self.calls, ["pumps", "uv", "cameras"])
+        self.assertTrue(all(h["ok"] for h in ks.event.hooks))
+        # Nothing claims the rail dropped, because nothing can.
+        self.assertIsNone(ks.event.rails_confirmed_dead)
+
+    def test_latch_still_blocks_the_next_start(self):
+        ks = self.make()
+        ks.arm()
+        ks.trip(TriggerSource.MANUAL, "lid opened by hand mid-run")
+        self.assertTrue(os.path.exists(ks.cfg.LATCH_PATH))
+
+        again = self.make()
+        with self.assertRaises(KillSwitchLatched):
+            again.arm()
+
+        self.assertTrue(clear_latch(ks.cfg))
+        third = self.make()
+        third.arm()
+        self.assertTrue(third.armed)
+        third.disarm()
 
 
 if __name__ == "__main__":

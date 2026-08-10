@@ -10,8 +10,9 @@ Hardware:
     MOSFET gate --[10k pulldown]--> GND
     MOSFET drain --> UV strip (-)
     MOSFET source --> common GND
-    12V (+) --[fuse]--[switch]--> UV strip (+)
+    12V (+) --[fuse]--[LID INTERLOCK SWITCH]--> UV strip (+)
     12V (-) --> common GND
+    The lid switch is mechanical only: no sense wire back to the Pi.
 
     MCP3008 ADC on SPI0:
         VDD/VREF -> 3.3V, AGND/DGND -> GND
@@ -39,16 +40,18 @@ Commands once running:
     run <sec>                 - full experiment cycle:
                                   before-photo, UV on, log sensor, UV off, after-photo
     status                    - show current state
-    kill [reason]             - software E-stop: cut the 12V rails and exit
-    interlock                 - show kill switch / E-stop loop state
+    kill [reason]             - software stop: everything off, latch, exit
+    interlock                 - show kill switch / interlock state
     help                      - this message
     quit                      - turn UV off and exit
 
 Kill switch:
-    A latching E-stop cuts the 12V rails in hardware, with no involvement from
-    the Pi. This script additionally watches the E-stop loop and runs a
-    watchdog; see killswitch/DESIGN.md. After any kill event the latch file
-    blocks the next start until it is cleared deliberately:
+    A lid interlock switch in series with the 12V feed cuts power mechanically,
+    with no involvement from the Pi -- and with no way for the Pi to see it.
+    This script additionally runs a software watchdog that, on a fault, drops
+    UV_PIN (and so the MOSFET gate), logs, latches and exits; see
+    killswitch/DESIGN.md. After any kill event the latch file blocks the next
+    start until it is cleared deliberately:
         python3 -m killswitch --status
         python3 -m killswitch --clear-latch
 """
@@ -318,16 +321,21 @@ def cmd_status(_args):
     print(f"  Data dir:      {DATA_DIR}")
     if kill_switch:
         ks = kill_switch.status()
-        print(f"  Interlock:     {'CLOSED (healthy)' if ks['sense_healthy'] else 'OPEN — KILL'}"
-              f"  armed={ks['armed']}")
+        if ks["sense_healthy"] is None:
+            # No sense contact on the lid switch: silence here means "not
+            # observable", which must not be reported as either state.
+            interlock = "mechanical lid switch (not visible to software)"
+        else:
+            interlock = "CLOSED (healthy)" if ks["sense_healthy"] else "OPEN — KILL"
+        print(f"  Interlock:     {interlock}  armed={ks['armed']}")
     r = read_uv()
     print(f"  Live sensor:   {r['mw_cm2']:.3f} mW/cm^2")
 
 def cmd_kill(args):
-    """Software E-stop. Same shutdown path as the physical button: rails down,
-    everything off, event logged, latched, process exits."""
+    """Software stop: UV off, logging stopped, cameras closed, event logged,
+    latched, process exits. Does not cut the 12V feed -- only the lid does."""
     if not kill_switch:
-        print("Kill switch not armed; use the physical E-stop.")
+        print("Kill switch not armed; open the lid to cut power.")
         return
     reason = " ".join(args) if args else "operator issued 'kill' at the chamber prompt"
     kill_switch.trip(TriggerSource.MANUAL, reason)
@@ -343,9 +351,10 @@ def cmd_help(_args):
     print(__doc__.split("Commands once running:")[1].split("\n\n")[0])
 
 # ---------- Kill switch ----------
-# Layer 1 (the latching E-stop wired into the 12V contactor coil) works with no
-# help from this script. What follows registers the software half: the shutdown
-# actions the listener and watchdog run, and the state recorded with the event.
+# Layer 1 (the lid interlock switch in the 12V feed) works with no help from
+# this script, and is invisible to it. What follows registers the software
+# half: the shutdown actions the watchdog runs -- on this rig they are the only
+# de-energizing software can do -- and the state recorded with the event.
 
 def _stop_logging():
     """Idempotent: stop the sensor logger and close its CSV."""
@@ -388,7 +397,7 @@ def _chamber_state():
 
 def init_kill_switch():
     """Arm before anything can be energized. Refuses to run if a previous kill
-    is still latched or if the E-stop loop is open."""
+    is still latched."""
     global kill_switch
     # Share chamber.py's already-open gpiochip handle rather than opening a
     # second one against the same chip.

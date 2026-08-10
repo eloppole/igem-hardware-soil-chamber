@@ -14,8 +14,15 @@ from .core import KillSwitch, TriggerSource, clear_latch, latch_info
 
 def cmd_status() -> int:
     info = latch_info()
-    print(f"config      : sense=GPIO{cfg.KILL_SENSE_PIN} (kill level {cfg.SENSE_KILL_LEVEL}), "
-          f"arm=GPIO{cfg.KILL_ARM_PIN} (assert {cfg.ARM_ASSERT_LEVEL})")
+    sense = (f"GPIO{cfg.KILL_SENSE_PIN} (kill level {cfg.SENSE_KILL_LEVEL})"
+             if cfg.INTERLOCK_SENSE_ENABLED else "not wired — lid switch has no sense contact")
+    arm = (f"GPIO{cfg.KILL_ARM_PIN} (assert {cfg.ARM_ASSERT_LEVEL})"
+           if cfg.INTERLOCK_ARM_ENABLED else "not wired — software cannot cut the 12 V rail")
+    print(f"interlock   : sense={sense}")
+    print(f"              arm  ={arm}")
+    if not (cfg.INTERLOCK_SENSE_ENABLED or cfg.INTERLOCK_ARM_ENABLED):
+        print("              a trip commands the loads off via the shutdown hooks,")
+        print("              logs, latches and exits; the lid is the only rail cut.")
     print(f"watchdog    : heartbeat {cfg.HEARTBEAT_TIMEOUT_S}s, "
           f"flow check {'on' if cfg.FLOW_CHECK_ENABLED else 'OFF (pending calibration)'}, "
           f"overcurrent {'on' if cfg.OVERCURRENT_CHECK_ENABLED else 'off'}, "
@@ -39,8 +46,9 @@ def cmd_clear_latch() -> int:
 
 
 def cmd_selftest() -> int:
-    """Arms against the real hardware, reads the loop, then disarms. Does not
-    touch pumps or UV — nothing is registered as a shutdown hook."""
+    """Arms against the real hardware, reads whatever interlock exists, then
+    disarms. Does not touch pumps or UV — nothing is registered as a shutdown
+    hook."""
     ks = KillSwitch()
     try:
         ks.arm()
@@ -48,7 +56,16 @@ def cmd_selftest() -> int:
         print(f"ARM FAILED: {exc}")
         return 1
     print(json.dumps(ks.status(), indent=2, default=str))
-    print("\nPress the E-stop within 20 s to verify the listener, or Ctrl-C to stop.")
+
+    if not cfg.INTERLOCK_SENSE_ENABLED:
+        print("\nNo sense contact is wired, so there is no lid event for the listener")
+        print("to catch and nothing to press. Verify the lid switch with a meter")
+        print("instead: continuity closed with the lid shut, open with it raised.")
+        print("What is armed above is the watchdog, the event log and the latch.")
+        ks.disarm(reason="selftest complete")
+        return 0
+
+    print("\nOpen the lid within 20 s to verify the listener, or Ctrl-C to stop.")
     tripped = ks.wait_for_trip(timeout=20)
     if not tripped:
         print("No trigger seen in 20 s.")
@@ -63,7 +80,7 @@ def main(argv=None) -> int:
     group.add_argument("--status", action="store_true", help="show config and latch state")
     group.add_argument("--clear-latch", action="store_true", help="clear a latched kill event")
     group.add_argument("--selftest", action="store_true",
-                       help="arm on real hardware and wait for an E-stop press")
+                       help="arm on real hardware and report the interlock state")
     args = parser.parse_args(argv)
 
     if args.clear_latch:

@@ -133,9 +133,11 @@ def stop_camera_after(index, seconds):
         pass
 
 # ── KILL SWITCH ───────────────────────────────────────────────────
-# The latching E-stop cuts both 12V rails in hardware without the Pi. What
-# follows is the software half: the shutdown actions the listener and watchdog
-# run, and the state recorded with the event. See killswitch/DESIGN.md.
+# The lid interlock switch cuts the 12V feed in hardware without the Pi, and
+# without the Pi being able to see it. What follows is the software half: the
+# shutdown actions the watchdog runs -- on this rig they are the only
+# de-energizing software can do -- and the state recorded with the event.
+# See killswitch/DESIGN.md.
 
 def all_pumps_off():
     """Idempotent: safe to call when the pumps are already off or unpowered."""
@@ -190,7 +192,7 @@ def chamber_state():
 
 def init_kill_switch():
     """Arm before the server accepts requests. Refuses to start if a previous
-    kill is still latched or the E-stop loop is open."""
+    kill is still latched."""
     global kill_switch
     ks = KillSwitch(GPIO_BACKEND="gpiozero")
     ks.register_shutdown_hook(all_pumps_off, "pumps-off",     priority=0)
@@ -274,11 +276,12 @@ input[type=number]::placeholder { color: #475569; }
   <div class="card full estop-card">
     <div class="card-title">Emergency stop</div>
     <div class="row">
-      <button class="btn btn-stop" onclick="softKill()">SOFTWARE E-STOP</button>
+      <button class="btn btn-stop" onclick="softKill()">SOFTWARE STOP</button>
       <span class="pill" id="interlock-pill">—</span>
       <span class="estop-note">
-        The physical latching E-stop is the primary cut and works with the Pi off.
-        This button runs the same shutdown path, then stops the server.
+        Opening the lid cuts the 12&nbsp;V feed mechanically and works with the Pi off
+        &mdash; that is the real stop. This button commands every load off, latches
+        and stops the server, but it cannot cut the rail.
       </span>
     </div>
   </div>
@@ -400,7 +403,8 @@ function timedCam(i) {
   fetch(`/cam/run/${i}?seconds=${secs}`).then(poll);
 }
 function softKill() {
-  if (!confirm('Cut both 12V rails, stop everything and shut down the server?\n\n'
+  if (!confirm('Turn every pump and the UV strip off, then shut down the server?\n\n'
+             + 'This does not cut the 12V feed — open the lid for that.\n'
              + 'Restarting requires clearing the kill latch on the Pi.')) return;
   // POST so that no link prefetch or page reload can ever fire this.
   fetch('/kill', {method: 'POST'}).catch(() => {});
@@ -410,8 +414,12 @@ function softKill() {
 function setInterlock(d) {
   const el = document.getElementById('interlock-pill');
   if (!el) return;
-  if (d.interlock === undefined || d.interlock === null) {
+  if (d.armed === undefined) {
     el.textContent = 'NOT ARMED'; el.className = 'pill pill-off';
+  } else if (!d.interlock_wired) {
+    // Lid switch has no sense contact: the watchdog is live, the lid is not
+    // observable. Saying "OK" here would be a claim we cannot make.
+    el.textContent = 'WATCHDOG ARMED'; el.className = 'pill pill-on';
   } else if (d.interlock) {
     el.textContent = 'INTERLOCK OK'; el.className = 'pill pill-on';
   } else {
@@ -462,17 +470,21 @@ def status():
         data[f"cam{i}_remaining"]   = round(max(0.0, cam_end_time[i] - now), 1) if cam_end_time[i] > now else 0.0
     if kill_switch:
         ks = kill_switch.status()
-        data["interlock"] = ks["sense_healthy"]
-        data["armed"]     = ks["armed"]
+        # None = no sense wire on the lid switch, which is not the same as an
+        # open loop. The UI shows those as different states.
+        data["interlock"]      = ks["sense_healthy"]
+        data["interlock_wired"] = ks["interlock_sense_enabled"]
+        data["armed"]          = ks["armed"]
     return jsonify(data)
 
 @app.route("/kill", methods=["POST"])
 def kill():
-    """Software E-stop. POST only, so nothing can trigger it by following a
-    link. Runs the same shutdown path as the physical button, then exits."""
+    """Software stop. POST only, so nothing can trigger it by following a link.
+    Commands every load off, latches and exits -- it cannot cut the 12V feed,
+    which only the lid switch does."""
     if not kill_switch:
         return ("kill switch not armed", 503)
-    kill_switch.trip(TriggerSource.MANUAL, "software E-stop from the web UI "
+    kill_switch.trip(TriggerSource.MANUAL, "software stop from the web UI "
                                            f"({request.remote_addr})")
     return ("", 204)
 

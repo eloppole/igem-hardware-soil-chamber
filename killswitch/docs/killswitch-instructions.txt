@@ -1,0 +1,8 @@
+The physical kill switch is more like a circuit switch (not an emergency switch)
+when the lid is closed, it will press a switch (like a keyboard switch) that will close a circuit.
+
+If the lid is open, tt will break the circuit after the mosfet
+Before the buck converter
+The buck converter has capacitors so it will regulate the circuit
+Obviously it will act as a resistor right before the LEDs which isnt good but im hoping the capacitors on the buck converters will fix it
+If it takes too long for the LEDs to turn off after the circuit is broken because of the capacitors then we’ll put the buck converter before the kill switch and add a regulator

@@ -1,19 +1,23 @@
 """
 Layered kill switch for the iGEM wildfire soil chamber (Raspberry Pi 5).
 
-Layer 1 (hardware, not implemented here): a latching 2NC E-stop in series with
-the 12 V contactor coil loop. It cuts power with no involvement from the Pi.
-This module assumes it exists and never assumes power is still present.
+Layer 1 (hardware, not implemented here): the lid interlock — a switch held
+closed by the lid, in series with the 12 V positive feed. Opening the lid cuts
+the rail with no involvement from the Pi. This module assumes it exists and
+never assumes power is still present.
 
-Layer 2 (this module): a listener watching the E-stop's second contact. On an
-active trigger it stops pumps, drops the UV pin, closes cameras and files,
-logs the event, latches, and exits without restarting.
+Layer 2 (this module, OFF on the rig as built): a listener watching a sense
+contact on that switch. Only runs when config.INTERLOCK_SENSE_ENABLED — the lid
+switch currently has no low-voltage contact, so there is nothing to listen to.
 
 Layer 3 (this module): a watchdog that independently checks heartbeat, flow,
-current and temperature, and cuts the rails through the same contactor coil
-loop that the physical button breaks.
+current and temperature. Where a Pi-side interlock exists
+(config.INTERLOCK_ARM_ENABLED) it opens the 12 V feed directly; otherwise it
+degrades to commanding every load off through the registered shutdown hooks —
+each load's MOSFET gate goes low — then logs, latches and exits.
 
-Wiring model and the reasoning behind it: see DESIGN.md.
+Wiring model and the reasoning behind it: see DESIGN.md and
+docs/circuit_image.svg.
 """
 
 from __future__ import annotations
@@ -52,9 +56,10 @@ __all__ = [
 class TriggerSource(str, Enum):
     """What fired the kill. Recorded verbatim in every log line."""
 
-    # A wire break is indistinguishable from a press by design -- both mean
+    # A wire break is indistinguishable from an open lid by design -- both mean
     # "the interlock loop is open", and both are treated as an active trigger.
-    ESTOP_LOOP = "estop_button_or_loop_open"
+    # Only reachable when a sense contact is wired (INTERLOCK_SENSE_ENABLED).
+    INTERLOCK_LOOP = "interlock_loop_open"
     WATCHDOG_HEARTBEAT = "watchdog_heartbeat_timeout"
     WATCHDOG_FLOW = "watchdog_flow_anomaly"
     WATCHDOG_OVERCURRENT = "watchdog_overcurrent"
@@ -69,7 +74,7 @@ class KillSwitchLatched(RuntimeError):
 
 
 class InterlockOpen(RuntimeError):
-    """The E-stop loop is already open at startup (button in, or wire off)."""
+    """The interlock loop is already open at startup (lid up, or wire off)."""
 
 
 @dataclass
@@ -210,7 +215,8 @@ class KillSwitch:
     def register_shutdown_hook(self, func: Callable[[], Any], name: str, priority: int = 100) -> None:
         """Register an idempotent power-down action. Lower priority runs first;
         put pumps before UV before cameras. Hooks must be safe to call when the
-        thing is already off -- the rails may already be dead."""
+        thing is already off -- the rail may already be dead. On the rig as
+        built these hooks *are* the shutdown: nothing else de-energizes."""
         self._hook_seq += 1
         self._hooks.append(_Hook(priority=priority, seq=self._hook_seq, name=name, func=func))
         self._hooks.sort()
@@ -267,45 +273,35 @@ class KillSwitch:
     # -- arming -------------------------------------------------------------
 
     def arm(self) -> "KillSwitch":
-        """Claim the kill line, energize the interlock, start both threads."""
+        """Claim whatever interlock wiring exists, energize it, start the
+        monitoring threads. On the rig as built there is no such wiring, so this
+        arms the watchdog, the logging and the latch and nothing else."""
         if self._armed:
             return self
         cfg = self.cfg
 
+        # Unconditional, and first: a previous kill blocks the next start
+        # whether or not any interlock is wired.
         self._check_latch()
 
-        if self._backend is None:
-            self._backend = open_backend(cfg, self._gpio_handle)
-        if self._backend.name == "sim":
+        if self._needs_gpio():
+            if self._backend is None:
+                self._backend = open_backend(cfg, self._gpio_handle)
+            if self._backend.name == "sim":
+                self.log.warning(
+                    "SIMULATED GPIO backend — no hardware is being protected. "
+                    "This must never be the case on the chamber Pi."
+                )
+            self._claim_interlock_pins()
+            self._preflight_interlock()
+        else:
             self.log.warning(
-                "SIMULATED GPIO backend — no hardware is being protected. "
-                "This must never be the case on the chamber Pi."
+                "No Pi-side interlock is wired (INTERLOCK_SENSE_ENABLED and "
+                "INTERLOCK_ARM_ENABLED are both off). The lid switch is the only "
+                "cut for the 12 V rail: software can neither see it open nor open "
+                "it. A trip will command every load off through the shutdown "
+                "hooks, log, latch and exit — it cannot de-energize the rail."
             )
-
-        self._backend.claim_input(cfg.KILL_SENSE_PIN, cfg.SENSE_PULL)
-        # Claim the arm line de-asserted, so a crash between here and the
-        # assert below leaves the rails down rather than up.
-        self._backend.claim_output(cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
-        if cfg.RAIL_FEEDBACK_ENABLED:
-            self._backend.claim_input(cfg.RAIL_FEEDBACK_PIN, "up")
-
-        level = self._read_sense_or_fail()
-        if level == cfg.SENSE_KILL_LEVEL and cfg.REQUIRE_HEALTHY_LOOP_TO_ARM:
-            self._backend.close()
-            self._backend = None
-            raise InterlockOpen(
-                f"E-stop loop is open at startup (GPIO{cfg.KILL_SENSE_PIN} reads "
-                f"{level}). Release the E-stop and check the two sense wires, "
-                "then start again."
-            )
-
-        self._backend.write(cfg.KILL_ARM_PIN, cfg.ARM_ASSERT_LEVEL)
-        time.sleep(0.05)  # let the contactor settle before trusting the loop
-        if self._read_sense_or_fail() == cfg.SENSE_KILL_LEVEL and cfg.REQUIRE_HEALTHY_LOOP_TO_ARM:
-            self._backend.write(cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
-            self._backend.close()
-            self._backend = None
-            raise InterlockOpen("E-stop loop opened while arming; refusing to run.")
 
         now = time.monotonic()
         self._armed_at = now
@@ -313,17 +309,18 @@ class KillSwitch:
         self._armed = True
         self._stop_threads.clear()
 
-        self._start_thread(self._listener_loop, "killswitch-listener")
+        if cfg.INTERLOCK_SENSE_ENABLED:
+            self._start_thread(self._listener_loop, "killswitch-listener")
         if cfg.WATCHDOG_ENABLED:
             self._start_thread(self._watchdog_loop, "killswitch-watchdog")
 
         self._install_signal_handlers()
         self.log.info(
-            "ARMED  backend=%s sense=GPIO%d arm=GPIO%d heartbeat=%.1fs watchdog=%s "
+            "ARMED  backend=%s sense=%s arm=%s heartbeat=%.1fs watchdog=%s "
             "flow_check=%s exit_on_trip=%s",
-            self._backend.name,
-            cfg.KILL_SENSE_PIN,
-            cfg.KILL_ARM_PIN,
+            self._backend.name if self._backend else "none (no interlock pins)",
+            f"GPIO{cfg.KILL_SENSE_PIN}" if cfg.INTERLOCK_SENSE_ENABLED else "not wired",
+            f"GPIO{cfg.KILL_ARM_PIN}" if cfg.INTERLOCK_ARM_ENABLED else "not wired",
             cfg.HEARTBEAT_TIMEOUT_S,
             cfg.WATCHDOG_ENABLED,
             cfg.FLOW_CHECK_ENABLED,
@@ -332,6 +329,59 @@ class KillSwitch:
         if not cfg.EXIT_ON_TRIP:
             self.log.warning("EXIT_ON_TRIP is disabled — the host must exit on its own.")
         return self
+
+    def _needs_gpio(self) -> bool:
+        """True only if some interlock pin is actually wired. When nothing is,
+        the kill switch touches no GPIO at all — so it neither fights the host
+        for the chip nor needs a GPIO library to run."""
+        cfg = self.cfg
+        return bool(
+            cfg.INTERLOCK_SENSE_ENABLED
+            or cfg.INTERLOCK_ARM_ENABLED
+            or cfg.RAIL_FEEDBACK_ENABLED
+        )
+
+    def _claim_interlock_pins(self) -> None:
+        cfg = self.cfg
+        if cfg.INTERLOCK_SENSE_ENABLED:
+            self._backend.claim_input(cfg.KILL_SENSE_PIN, cfg.SENSE_PULL)
+        if cfg.INTERLOCK_ARM_ENABLED:
+            # Claim the arm line de-asserted, so a crash between here and the
+            # assert in _preflight_interlock leaves the rail down, not up.
+            self._backend.claim_output(cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
+        if cfg.RAIL_FEEDBACK_ENABLED:
+            self._backend.claim_input(cfg.RAIL_FEEDBACK_PIN, "up")
+
+    def _preflight_interlock(self) -> None:
+        """Refuse to start into an already-open interlock, then close it."""
+        cfg = self.cfg
+        if cfg.INTERLOCK_SENSE_ENABLED:
+            level = self._read_sense_or_fail()
+            if level == cfg.SENSE_KILL_LEVEL and cfg.REQUIRE_HEALTHY_LOOP_TO_ARM:
+                self._abort_arm()
+                raise InterlockOpen(
+                    f"Interlock loop is open at startup (GPIO{cfg.KILL_SENSE_PIN} "
+                    f"reads {level}). Close the lid and check the two sense wires, "
+                    "then start again."
+                )
+
+        if cfg.INTERLOCK_ARM_ENABLED:
+            self._backend.write(cfg.KILL_ARM_PIN, cfg.ARM_ASSERT_LEVEL)
+            time.sleep(0.05)  # let the interlock settle before trusting the loop
+            if (cfg.INTERLOCK_SENSE_ENABLED
+                    and cfg.REQUIRE_HEALTHY_LOOP_TO_ARM
+                    and self._read_sense_or_fail() == cfg.SENSE_KILL_LEVEL):
+                self._backend.write(cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
+                self._abort_arm()
+                raise InterlockOpen("Interlock loop opened while arming; refusing to run.")
+
+    def _abort_arm(self) -> None:
+        """Release the pins after a refused arm, leaving the interlock open."""
+        try:
+            self._backend.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._backend = None
 
     def _check_latch(self) -> None:
         cfg = self.cfg
@@ -383,8 +433,9 @@ class KillSwitch:
         return self._backend.read(self.cfg.KILL_SENSE_PIN)
 
     def _listener_loop(self) -> None:
-        """Layer 2. Watches the E-stop sense line; a read failure is itself a
-        trigger (we cannot prove the loop is healthy, so assume it is not)."""
+        """Layer 2. Watches the lid interlock's sense line; a read failure is
+        itself a trigger (we cannot prove the loop is healthy, so assume it is
+        not). Started only when INTERLOCK_SENSE_ENABLED."""
         cfg = self.cfg
         consecutive = 0
         while not self._stop_threads.is_set() and not self._tripped:
@@ -398,10 +449,10 @@ class KillSwitch:
                 consecutive += 1
                 if consecutive >= cfg.SENSE_CONFIRM_SAMPLES:
                     self.trip(
-                        TriggerSource.ESTOP_LOOP,
+                        TriggerSource.INTERLOCK_LOOP,
                         f"GPIO{cfg.KILL_SENSE_PIN} read kill level {level} on "
-                        f"{consecutive} consecutive samples — E-stop pressed or "
-                        "interlock wiring open",
+                        f"{consecutive} consecutive samples — lid opened or "
+                        "interlock wiring broken",
                     )
                     return
             else:
@@ -559,8 +610,9 @@ class KillSwitch:
         )
         self.log.critical("KILL [%s] %s", source.value, detail)
 
-        # 1. De-energize the contactor coil first — the fastest path to safe.
-        #    Everything after this is tidy-up on already-dead rails.
+        # 1. Open the Pi-side interlock first, where one exists — the fastest
+        #    path to safe. Without one this only logs, and the hooks in step 3
+        #    become the actual power-down.
         self._drop_arm_line()
 
         # 2. Snapshot before the hooks change anything.
@@ -569,7 +621,7 @@ class KillSwitch:
         # 3. Idempotent power-down hooks, each individually time-boxed.
         event.hooks = self._run_hooks()
 
-        # 4. Confirm the rails actually dropped, if the aux contact is wired.
+        # 4. Confirm the rail actually dropped, if a feedback contact is wired.
         event.rails_confirmed_dead = self._verify_rails_dead()
 
         # 5. Persist. Do this before releasing GPIO or exiting.
@@ -601,13 +653,19 @@ class KillSwitch:
 
     def _drop_arm_line(self) -> None:
         cfg = self.cfg
+        if not cfg.INTERLOCK_ARM_ENABLED:
+            self.log.critical(
+                "No Pi-side interlock to open — the 12 V rail stays live until the "
+                "lid is opened. Commanding every load off through the shutdown hooks."
+            )
+            return
         try:
             self._backend.write(cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
-            self.log.critical("Interlock released: GPIO%d -> %d (12 V rails cut)",
+            self.log.critical("Interlock released: GPIO%d -> %d (12 V rail cut)",
                               cfg.KILL_ARM_PIN, 1 - cfg.ARM_ASSERT_LEVEL)
         except Exception as exc:  # noqa: BLE001
-            self.log.critical("FAILED to release interlock GPIO%d: %r — the hardware "
-                              "E-stop is now the only power cut.", cfg.KILL_ARM_PIN, exc)
+            self.log.critical("FAILED to release interlock GPIO%d: %r — the lid "
+                              "switch is now the only power cut.", cfg.KILL_ARM_PIN, exc)
 
     def _snapshot_state(self) -> Dict[str, Any]:
         state: Dict[str, Any] = {
@@ -618,10 +676,7 @@ class KillSwitch:
             ),
             "heartbeat_source": self._heartbeat_source,
         }
-        try:
-            state["sense_pin_level"] = self._backend.read(self.cfg.KILL_SENSE_PIN)
-        except Exception as exc:  # noqa: BLE001
-            state["sense_pin_level"] = f"unreadable: {exc!r}"
+        state["sense_pin_level"] = self._read_sense_for_report()
         if self._state_provider is not None:
             ok, value, error = _run_with_timeout(
                 self._state_provider, self.cfg.STATE_SNAPSHOT_TIMEOUT_S, "state-provider"
@@ -662,16 +717,17 @@ class KillSwitch:
             return None
         if live:
             self.log.critical(
-                "RAILS STILL LIVE after kill — suspect a welded contactor. "
-                "Press the hardware E-stop and disconnect the 12 V supplies now."
+                "RAIL STILL LIVE after kill — suspect a welded contact. "
+                "Open the lid and disconnect the 12 V supply now."
             )
         return not live
 
     # -- clean shutdown -----------------------------------------------------
 
     def disarm(self, reason: str = "normal shutdown") -> None:
-        """Normal exit path: stop the threads, power everything down, release
-        the interlock. No latch is written, so the next run may start."""
+        """Normal exit path: stop the threads, run the shutdown hooks so every
+        load is commanded off, and release the interlock if one is wired. No
+        latch is written, so the next run may start."""
         if not self._armed or self._tripped:
             return
         self._armed = False
@@ -679,7 +735,7 @@ class KillSwitch:
         for thread in self._threads:
             thread.join(timeout=1.0)
         self._threads.clear()
-        self.log.info("DISARM (%s) — running shutdown hooks and cutting the rails.", reason)
+        self.log.info("DISARM (%s) — running shutdown hooks and releasing the interlock.", reason)
         self._run_hooks()
         self._drop_arm_line()
         self._release_gpio()
@@ -698,20 +754,36 @@ class KillSwitch:
         """Block until a kill fires. Useful when EXIT_ON_TRIP is disabled."""
         return self._tripped_flag.wait(timeout)
 
+    def _read_sense_for_report(self):
+        """Sense level for logs and status. None means 'no sense wire exists',
+        which is not the same as 'the loop is open' — callers must not conflate
+        the two."""
+        if not self.cfg.INTERLOCK_SENSE_ENABLED or self._backend is None:
+            return None
+        try:
+            return self._backend.read(self.cfg.KILL_SENSE_PIN)
+        except Exception as exc:  # noqa: BLE001
+            return f"unreadable: {exc!r}"
+
     def status(self) -> Dict[str, Any]:
         cfg = self.cfg
-        try:
-            sense = self._backend.read(cfg.KILL_SENSE_PIN) if self._backend else None
-        except Exception as exc:  # noqa: BLE001
-            sense = f"unreadable: {exc!r}"
+        sense = self._read_sense_for_report()
+        if sense is None:
+            healthy = None                      # not observable, not unhealthy
+        elif isinstance(sense, int):
+            healthy = sense != cfg.SENSE_KILL_LEVEL
+        else:
+            healthy = False                     # unreadable: assume the worst
         return {
             "armed": self._armed,
             "tripped": self._tripped,
             "backend": self._backend.name if self._backend else None,
-            "sense_pin": cfg.KILL_SENSE_PIN,
+            "interlock_sense_enabled": cfg.INTERLOCK_SENSE_ENABLED,
+            "interlock_arm_enabled": cfg.INTERLOCK_ARM_ENABLED,
+            "sense_pin": cfg.KILL_SENSE_PIN if cfg.INTERLOCK_SENSE_ENABLED else None,
             "sense_level": sense,
-            "sense_healthy": (sense != cfg.SENSE_KILL_LEVEL) if isinstance(sense, int) else False,
-            "arm_pin": cfg.KILL_ARM_PIN,
+            "sense_healthy": healthy,
+            "arm_pin": cfg.KILL_ARM_PIN if cfg.INTERLOCK_ARM_ENABLED else None,
             "latched": bool(cfg.LATCH_ENABLED and os.path.exists(cfg.LATCH_PATH)),
             "watchdog_enabled": cfg.WATCHDOG_ENABLED,
             "flow_check_enabled": cfg.FLOW_CHECK_ENABLED,
