@@ -1,4 +1,5 @@
 # Code write-up — iGEM soil chamber
+Connor Ng
 
 What every file does, how the pieces fit, and how the software lines up against
 the circuit in [circuit_image.svg](circuit_image.svg).
